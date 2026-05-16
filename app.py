@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # ============================================================
 #  app.py  ―  中央競馬オッズ急変モニター 完全版（1ファイル）
 #
@@ -28,11 +28,16 @@ USER_AGENT = (
 import os, re, time, threading, datetime, sys, webbrowser
 from urllib.parse import urlparse, parse_qs
 from collections import deque
-from flask import Flask, jsonify
+from flask import Flask, jsonify, Response
 import requests
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
+
+JST = datetime.timezone(datetime.timedelta(hours=9), "JST")
+
+def now_jst():
+    return datetime.datetime.now(JST).replace(tzinfo=None)
 
 # ── グローバル状態 ─────────────────────────────────────────
 state = {
@@ -62,7 +67,7 @@ def _get(url, params=None):
         return None
 
 def _log(msg):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    ts = now_jst().strftime("%H:%M:%S")
     entry = f"[{ts}] {msg}"
     print(entry, flush=True)
     with lock:
@@ -70,7 +75,7 @@ def _log(msg):
 
 # ── 時刻パーサー ──────────────────────────────────────────
 def _parse_time(text):
-    now = datetime.datetime.now()
+    now = now_jst()
     m = re.search(r"(\d{1,2}):(\d{2})", text)
     if m:
         return now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
@@ -80,7 +85,7 @@ def _parse_time(text):
 # ── レース一覧取得 ────────────────────────────────────────
 def fetch_today_races():
     _log("本日のレース一覧を取得中...")
-    today = datetime.date.today()
+    today = now_jst().date()
     soup = _get(
         "https://race.netkeiba.com/top/race_list_sub.html",
         params={"kaisai_date": today.strftime("%Y%m%d")}
@@ -217,7 +222,7 @@ def detect_changes(race, prev_map, curr):
         if abs(pct) >= ODDS_CHANGE_THRESHOLD:
             direction = "急落 ⬇" if h["odds"] < old else "急騰 ⬆"
             alert = {
-                "time":       datetime.datetime.now().strftime("%H:%M:%S"),
+                "time":       now_jst().strftime("%H:%M:%S"),
                 "race":       race["full_name"],
                 "race_id":    race["race_id"],
                 "horse_num":  h["number"],
@@ -245,7 +250,7 @@ def monitor_loop():
             with lock:
                 races = list(state["races"])
 
-            now = datetime.datetime.now()
+            now = now_jst()
 
             for race in races:
                 race_id = race["race_id"]
@@ -322,7 +327,7 @@ def api_races():
         finished  = set(state["finished"])
 
     result = []
-    now = datetime.datetime.now()
+    now = now_jst()
 
     for r in races:
         race_id  = r["race_id"]
@@ -349,7 +354,7 @@ def api_odds(race_id):
     if cached:
         return jsonify({"horses": cached, "updated": updated, "cached": True})
     horses = fetch_odds(race_id)
-    updated = datetime.datetime.now().strftime("%H:%M:%S")
+    updated = now_jst().strftime("%H:%M:%S")
     with lock:
         state["odds"][race_id]         = horses
         state["last_updated"][race_id] = updated
@@ -360,7 +365,7 @@ def api_odds(race_id):
 @app.route("/api/odds/<race_id>/force")
 def api_odds_force(race_id):
     horses = fetch_odds(race_id)
-    updated = datetime.datetime.now().strftime("%H:%M:%S")
+    updated = now_jst().strftime("%H:%M:%S")
     with lock:
         state["odds"][race_id]         = horses
         state["last_updated"][race_id] = updated
@@ -393,7 +398,13 @@ HTML = """<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#08090d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="JRAオッズ">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
 <title>🏇 JRA オッズ急変モニター</title>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
@@ -746,6 +757,10 @@ let races       = [];
 let selectedVenue = null;
 
 // ── 初期化 ───────────────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/service-worker.js').catch(() => {}));
+}
+
 window.onload = () => {
   loadRaces();
   setInterval(loadRaces,  30000);   // 30秒ごとに自動更新
@@ -971,6 +986,49 @@ function showToast(title, body) {
 </html>
 """
 
+@app.route("/manifest.json")
+def manifest():
+    return jsonify({
+        "name": "JRA オッズ急変モニター",
+        "short_name": "JRAオッズ",
+        "description": "中央競馬のオッズ急変を監視するアプリ",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#08090d",
+        "theme_color": "#08090d",
+        "icons": [
+            {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"}
+        ]
+    })
+
+@app.route("/service-worker.js")
+def service_worker():
+    js = """
+const CACHE_NAME = 'jra-odds-monitor-v1';
+const CORE_ASSETS = ['/', '/manifest.json', '/static/icon-192.png', '/static/icon-512.png'];
+
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(CORE_ASSETS)));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+  if (url.pathname.startsWith('/api/')) return;
+  event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
+});
+""".strip()
+    return Response(js, mimetype="application/javascript")
+
 @app.route("/")
 def index():
     return HTML.replace("THRESHOLD_VAL", str(ODDS_CHANGE_THRESHOLD))
@@ -989,4 +1047,5 @@ if __name__ == "__main__":
     if is_local:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
+
 
