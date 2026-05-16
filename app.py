@@ -14,7 +14,7 @@
 
 # ━━ 設定 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHECK_INTERVAL_SEC    = 60     # オッズ確認頻度（秒）
-MONITOR_BEFORE_MIN    = 30     # 発走N分前から自動監視開始
+MONITOR_BEFORE_MIN    = 350     # 発走N分前から自動監視開始
 ODDS_CHANGE_THRESHOLD = 20.0   # 急変とみなす変化率（%）
 REQUEST_TIMEOUT       = 15
 REQUEST_INTERVAL_SEC  = 1
@@ -51,6 +51,7 @@ state = {
     "races":        [],          # 全レース（終了済み含む）
     "odds":         {},          # {race_id: [horse, ...]}
     "prev_odds":    {},          # {race_id: {number: odds}}
+    "first_odds":   {},          # {race_id: {number: odds}} - 初回取得オッズ
     "alerts":       deque(maxlen=200),
     "last_updated": {},          # {race_id: "HH:MM:SS"}
     "monitored":    set(),       # 監視中race_idセット
@@ -215,33 +216,65 @@ def fetch_odds(race_id):
         rows = drv.find_elements(By.CSS_SELECTOR, "tbody tr")
         horses = []
 
+        def parse_odds(text):
+            text = text.replace(",", "").replace("倍", "").strip()
+            if text in ["---.-", "", "取消"]:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
         for row in rows:
             try:
                 cols = row.find_elements(By.TAG_NAME, "td")
                 texts = [c.text.strip() for c in cols]
 
-                # 単勝表は 6列以上ある
-                if len(texts) < 6:
+                if len(texts) < 4:
                     continue
 
-                # netkeiba仕様
-                # 0=枠番
-                # 1=馬番
-                # 4=馬名
-                # 5=オッズ
+                # 馬番を探す
+                num = None
+                num_idx = None
+                for idx, text in enumerate(texts):
+                    if idx == 0 and text.isdigit():
+                        # 0列目は枠番、1列目が馬番の想定
+                        continue
+                    if text.isdigit():
+                        num = int(text)
+                        num_idx = idx
+                        break
 
-                if not texts[1].isdigit():
+                if num is None:
                     continue
 
-                num = int(texts[1])
-                name = texts[4]
+                # オッズを探す
+                odds = None
+                odds_idx = None
+                for idx in range(len(texts) - 1, num_idx, -1):
+                    parsed = parse_odds(texts[idx])
+                    if parsed is not None:
+                        odds = parsed
+                        odds_idx = idx
+                        break
 
-                odds_text = texts[5].replace(",", "").replace("倍", "").strip()
-
-                if odds_text in ["---.-", "", "取消"]:
+                if odds is None:
                     continue
 
-                odds = float(odds_text)
+                # 馬名は馬番の後、オッズの手前の最初のテキスト
+                name = None
+                for idx in range(num_idx + 1, odds_idx):
+                    text = texts[idx]
+                    if not text or text.isdigit() or text in ["---.-", "取消"]:
+                        continue
+                    name = text
+                    break
+
+                if not name and len(texts) > num_idx + 1:
+                    name = texts[num_idx + 1]
+
+                if not name:
+                    continue
 
                 horses.append({
                     "number": num,
@@ -249,13 +282,14 @@ def fetch_odds(race_id):
                     "odds": odds
                 })
 
-            except:
+            except Exception:
                 continue
 
-        # 馬番重複削除
+        # 馬番重複削除（先に出現した行を優先）
         unique = {}
         for h in horses:
-            unique[h["number"]] = h
+            if h["number"] not in unique:
+                unique[h["number"]] = h
 
         return sorted(unique.values(), key=lambda x: x["odds"])
 
@@ -264,29 +298,49 @@ def fetch_odds(race_id):
         return []
 
 # ── 急変検知 ──────────────────────────────────────────────
-def detect_changes(race, prev_map, curr):
+def detect_changes(race, prev_map, first_map, curr):
     for h in curr:
         old = prev_map.get(h["number"])
+        first = first_map.get(h["number"])
+        
         if old is None or old <= 0:
             continue
+        
         pct = (h["odds"] - old) / old * 100
-        if abs(pct) >= ODDS_CHANGE_THRESHOLD:
+        first_pct = None
+        if first is not None and first > 0:
+            first_pct = (h["odds"] - first) / first * 100
+        
+        # 前回比または初回比で閾値を超えたかチェック
+        trigger_prev = abs(pct) >= ODDS_CHANGE_THRESHOLD
+        trigger_first = first_pct is not None and abs(first_pct) >= ODDS_CHANGE_THRESHOLD
+        if trigger_prev or trigger_first:
             direction = "人気上昇 ↑" if h["odds"] < old else ""
+            triggered_by = (
+                "both" if trigger_prev and trigger_first else
+                "first" if trigger_first else
+                "prev"
+            )
             alert = {
-                "time":       now_jst().strftime("%H:%M:%S"),
-                "race":       race["full_name"],
-                "race_id":    race["race_id"],
-                "horse_num":  h["number"],
-                "horse_name": h["name"],
-                "old_odds":   old,
-                "new_odds":   h["odds"],
-                "change_pct": round(pct, 1),
-                "direction":  direction,
+                "time":          now_jst().strftime("%H:%M:%S"),
+                "race":          race["full_name"],
+                "race_id":       race["race_id"],
+                "horse_num":     h["number"],
+                "horse_name":    h["name"],
+                "old_odds":      old,
+                "new_odds":      h["odds"],
+                "change_pct":    round(pct, 1),
+                "direction":     direction,
+                "first_odds":    first,
+                "first_change_pct": round(first_pct, 1) if first_pct is not None else None,
+                "triggered_by":  triggered_by,
             }
             with lock:
                 state["alerts"].appendleft(alert)
+            first_info = f" (初回比: {first}倍→{h['odds']}倍 {first_pct:+.1f}%)" if first_pct is not None else ""
+            reason = "前回比" if trigger_prev and not trigger_first else "初回比" if trigger_first and not trigger_prev else "前回比・初回比"
             _log(f"🚨 急変検知! {race['full_name']} {h['number']}番 {h['name']} "
-                 f"{old}倍→{h['odds']}倍 ({direction} {abs(pct):.1f}%)")
+                 f"{old}倍→{h['odds']}倍 ({direction} {abs(pct):.1f}% / {reason}){first_info}")
 
 # ── メイン監視ループ ──────────────────────────────────────
 def monitor_loop():
@@ -334,14 +388,18 @@ def monitor_loop():
 
                 with lock:
                     prev_map = state["prev_odds"].get(race_id, {})
+                    first_map = state["first_odds"].get(race_id, {})
 
                 if prev_map:
-                    detect_changes(race, prev_map, horses)
+                    detect_changes(race, prev_map, first_map, horses)
                 else:
                     _log(f"  初回オッズ取得: {race['full_name']} ({len(horses)}頭)")
 
                 with lock:
                     state["odds"][race_id]         = horses
+                    # 初回オッズをまだ保存していなければ保存
+                    if not state["first_odds"].get(race_id):
+                        state["first_odds"][race_id] = {h["number"]: h["odds"] for h in horses}
                     state["prev_odds"][race_id]    = {h["number"]: h["odds"] for h in horses}
                     state["last_updated"][race_id] = now.strftime("%H:%M:%S")
 
@@ -356,8 +414,21 @@ def monitor_loop():
 def init_races():
     time.sleep(1)
     races = fetch_today_races()
+    now = now_jst()
     with lock:
         state["races"] = races
+        # 自動監視開始のタイミングに合致するレースを事前に監視対象に追加
+        for r in races:
+            try:
+                start_dt = datetime.datetime.fromisoformat(r["start_dt"])
+                mt = (start_dt - now).total_seconds() / 60
+                # 登録は「残り分数が0以上かつ閾値以下」の場合のみ行う
+                if 0 <= mt <= MONITOR_BEFORE_MIN:
+                  if r["race_id"] not in state["monitored"]:
+                    state["monitored"].add(r["race_id"])
+                    _log(f"▶ 自動監視登録: {r['full_name']} (あと{mt:.0f}分, thr={MONITOR_BEFORE_MIN}分)")
+            except Exception:
+                continue
 
 threading.Thread(target=init_races,  daemon=True).start()
 threading.Thread(target=monitor_loop, daemon=True).start()
@@ -366,8 +437,21 @@ threading.Thread(target=monitor_loop, daemon=True).start()
 @app.route("/api/races/refresh")
 def api_races_refresh():
     races = fetch_today_races()
+    now = now_jst()
     with lock:
         state["races"] = races
+        # 更新時にも自動監視登録を行う
+        for r in races:
+            try:
+                start_dt = datetime.datetime.fromisoformat(r["start_dt"])
+                mt = (start_dt - now).total_seconds() / 60
+                # 登録は「残り分数が0以上かつ閾値以下」の場合のみ行う
+                if 0 <= mt <= MONITOR_BEFORE_MIN:
+                  if r["race_id"] not in state["monitored"]:
+                    state["monitored"].add(r["race_id"])
+                    _log(f"▶ 自動監視登録: {r['full_name']} (あと{mt:.0f}分, thr={MONITOR_BEFORE_MIN}分)")
+            except Exception:
+                continue
     return jsonify(races)
 
 @app.route("/api/races")
@@ -414,6 +498,9 @@ def api_odds(race_id):
     updated = now_jst().strftime("%H:%M:%S")
     with lock:
         state["odds"][race_id]         = horses
+        # 初回オッズをまだ保存していなければ保存
+        if not state["first_odds"].get(race_id):
+            state["first_odds"][race_id] = {h["number"]: h["odds"] for h in horses}
         state["prev_odds"][race_id]    = {h["number"]: h["odds"] for h in horses}
         state["last_updated"][race_id] = updated
     return jsonify({"horses": horses,
@@ -427,14 +514,22 @@ def api_odds_force(race_id):
     race = _race_by_id(race_id)
     with lock:
         prev_map = state["prev_odds"].get(race_id, {})
+    first_map = state["first_odds"].get(race_id, {})
 
     if horses and prev_map and race:
-        detect_changes(race, prev_map, horses)
+        detect_changes(race, prev_map, first_map, horses)
 
     with lock:
-        state["odds"][race_id]         = horses
-        state["prev_odds"][race_id]    = {h["number"]: h["odds"] for h in horses}
-        state["last_updated"][race_id] = updated
+      state["odds"][race_id]         = horses
+      # 初回オッズをまだ保存していなければ保存
+      if not state["first_odds"].get(race_id):
+        state["first_odds"][race_id] = {h["number"]: h["odds"] for h in horses}
+      state["prev_odds"][race_id]    = {h["number"]: h["odds"] for h in horses}
+      state["last_updated"][race_id] = updated
+      # 手動取得による監視開始（クリックで取得したら監視対象にする）
+      state["monitored"].add(race_id)
+      if race:
+        _log(f"▶ 手動監視開始: {race['full_name']}")
     return jsonify({"horses": horses,
                     "updated": updated,
                     "cached": False})
@@ -829,10 +924,10 @@ if ('serviceWorker' in navigator) {
 
 window.onload = () => {
   loadRaces();
-  setInterval(loadRaces,  30000);   // 30秒ごとに自動更新
+  setInterval(loadRaces,  5000);    // 5秒ごとに自動更新（監視開始の検出を素早く）
   setInterval(pollAlerts, 5000);    // 5秒ごとにアラート確認
   setInterval(pollLog,    8000);    // 8秒ごとにログ確認
-  setInterval(refreshSelectedOdds, 60000); // 選択中レースは60秒ごとに最新オッズへ更新
+  setInterval(refreshSelectedOdds, 10000); // 選択中レースは10秒ごとに最新オッズへ更新
 };
 
 // ── レース一覧 ───────────────────────────────────────────
@@ -844,6 +939,13 @@ async function loadRaces() {
     races = await res.json();
     renderRaces(races);
     updateHeaderStats(races);
+
+    if (!selRace) {
+      const auto = races.find(r => r.status === 'monitoring');
+      if (auto) {
+        await pickRaceById(auto.race_id);
+      }
+    }
   } catch(e) {
     console.error(e);
     if (el) el.innerHTML = '<div class="empty">レース一覧の読み込みに失敗しました<br><small>再読み込みしてください</small></div>';
@@ -1025,9 +1127,13 @@ async function pollAlerts() {
     const alerts = await (await fetch('/api/alerts')).json();
     if (alerts.length > knownAlerts && knownAlerts > 0) {
       const a = alerts[0];
+      let toast_msg = `${a.old_odds}→${a.new_odds}倍 ${a.direction} ${Math.abs(a.change_pct)}%`;
+      if (a.first_change_pct !== null) {
+        toast_msg += ` [初回比: ${Math.abs(a.first_change_pct)}%]`;
+      }
       showToast(
         `🚨 ${a.race}`,
-        `${a.horse_num}番 ${a.horse_name}  ${a.old_odds}→${a.new_odds}倍  ${a.direction} ${Math.abs(a.change_pct)}%`
+        `${a.horse_num}番 ${a.horse_name} ${toast_msg}`
       );
     }
     knownAlerts = alerts.length;
@@ -1041,6 +1147,9 @@ async function pollAlerts() {
     }
     el.innerHTML = alerts.map(a => {
       const d = a.change_pct < 0 ? 'up' : '';
+      const first_info = a.first_odds && a.first_change_pct !== null
+        ? `<span style="font-size:.75rem;color:var(--muted);margin-top:4px;display:block">初回比: ${a.first_odds}→${a.new_odds}倍 (${(a.first_change_pct >= 0 ? '+' : '')}${a.first_change_pct.toFixed(1)}%)</span>`
+        : '';
       return `<div class="alert-card ${d}">
         <div class="ac-time">${a.time}</div>
         <div class="ac-body">
@@ -1050,6 +1159,7 @@ async function pollAlerts() {
         <div class="ac-change ${d}">
           ${a.old_odds}倍→${a.new_odds}倍<br>
           <span class="ac-pct">${a.direction} ${Math.abs(a.change_pct)}%</span>
+          ${first_info}
         </div>
       </div>`;
     }).join('');
@@ -1158,7 +1268,16 @@ if __name__ == "__main__":
     print("=" * 52)
 
     if is_local:
-        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+      def _open_browser():
+        try:
+          # まず localhost を開き、失敗したら 127.0.0.1 を試す（タブの二重化を防ぐ）
+          opened = webbrowser.open(url, new=2)
+          if not opened:
+            webbrowser.open(f"http://127.0.0.1:{port}", new=2)
+          _log(f"ブラウザを開きました: {url} (opened={opened})")
+        except Exception as e:
+          print(f"[BROWSER OPEN ERROR] {e}")
+      threading.Timer(2.5, _open_browser).start()
     app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
 
 
