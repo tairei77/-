@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # ============================================================
 #  app.py  ―  中央競馬オッズ急変モニター 完全版（1ファイル）
 #
@@ -1006,8 +1006,8 @@ def manifest():
 @app.route("/service-worker.js")
 def service_worker():
     js = """
-const CACHE_NAME = 'jra-odds-monitor-v1';
-const CORE_ASSETS = ['/', '/manifest.json', '/static/icon-192.png', '/static/icon-512.png'];
+const CACHE_NAME = 'jra-odds-monitor-v2';
+const CORE_ASSETS = ['/manifest.json', '/static/icon-192.png', '/static/icon-512.png'];
 
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(CORE_ASSETS)));
@@ -1016,14 +1016,14 @@ self.addEventListener('install', event => {
 
 self.addEventListener('activate', event => {
   event.waitUntil(
-    caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
+    caches.keys().then(keys => Promise.all(keys.map(key => caches.delete(key))))
   );
   self.clients.claim();
 });
 
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
-  if (url.pathname.startsWith('/api/')) return;
+  if (event.request.mode === 'navigate' || url.pathname === '/' || url.pathname.startsWith('/api/')) return;
   event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
 });
 """.strip()
@@ -1031,7 +1031,8 @@ self.addEventListener('fetch', event => {
 
 @app.route("/")
 def index():
-    return HTML.replace("THRESHOLD_VAL", str(ODDS_CHANGE_THRESHOLD))
+    html = HTML.replace("THRESHOLD_VAL", str(ODDS_CHANGE_THRESHOLD))
+    return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
@@ -1047,5 +1048,8 @@ if __name__ == "__main__":
     if is_local:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
+
+
+
 
 
