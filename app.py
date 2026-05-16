@@ -14,7 +14,7 @@
 
 # ━━ 設定 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHECK_INTERVAL_SEC    = 60     # オッズ確認頻度（秒）
-MONITOR_BEFORE_MIN    = 600     # 発走N分前から自動監視開始
+MONITOR_BEFORE_MIN    = 30     # 発走N分前から自動監視開始
 ODDS_CHANGE_THRESHOLD = 20.0   # 急変とみなす変化率（%）
 REQUEST_TIMEOUT       = 15
 REQUEST_INTERVAL_SEC  = 1
@@ -204,88 +204,64 @@ def get_driver():
 def fetch_odds(race_id):
     url = f"https://race.netkeiba.com/odds/index.html?race_id={race_id}&type=b1"
 
-    options = Options()
-    # headless外す（表示しないと取得失敗する環境ある）
-    # options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument(f"user-agent={USER_AGENT}")
-
-    drv = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
-    )
-
     try:
+        drv = get_driver()
         drv.get(url)
 
-        WebDriverWait(drv, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "tbody tr"))
+        WebDriverWait(drv, 5).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "tbody tr"))
         )
 
         rows = drv.find_elements(By.CSS_SELECTOR, "tbody tr")
-        horses_dict = {}
+        horses = []
 
         for row in rows:
             try:
                 cols = row.find_elements(By.TAG_NAME, "td")
-                texts = [c.text.strip() for c in cols if c.text.strip()]
+                texts = [c.text.strip() for c in cols]
 
-                # デバッグ用
-                # print(texts)
-
-                if len(texts) < 4:
+                # 単勝表は 6列以上ある
+                if len(texts) < 6:
                     continue
 
-                # 馬番
-                if not texts[0].isdigit():
-                    continue
-                num = int(texts[0])
+                # netkeiba仕様
+                # 0=枠番
+                # 1=馬番
+                # 4=馬名
+                # 5=オッズ
 
-                # 馬名探し（日本語含む列）
-                name = None
-                for t in texts:
-                    if any('\u3040' <= ch <= '\u30ff' or '\u4e00' <= ch <= '\u9fff' for ch in t):
-                        if not t.replace(".", "").isdigit():
-                            name = t
-                            break
-
-                if not name:
+                if not texts[1].isdigit():
                     continue
 
-                # オッズ探し
-                odds = None
-                for t in reversed(texts):
-                    t2 = t.replace("倍", "").replace(",", "")
-                    try:
-                        v = float(t2)
-                        if 1 <= v <= 9999:
-                            odds = v
-                            break
-                    except:
-                        continue
+                num = int(texts[1])
+                name = texts[4]
 
-                if odds is None:
+                odds_text = texts[5].replace(",", "").replace("倍", "").strip()
+
+                if odds_text in ["---.-", "", "取消"]:
                     continue
 
-                horses_dict[num] = {
+                odds = float(odds_text)
+
+                horses.append({
                     "number": num,
                     "name": name,
                     "odds": odds
-                }
+                })
 
             except:
                 continue
 
-        horses = list(horses_dict.values())
-        return sorted(horses, key=lambda x: x["number"])
+        # 馬番重複削除
+        unique = {}
+        for h in horses:
+            unique[h["number"]] = h
+
+        return sorted(unique.values(), key=lambda x: x["odds"])
 
     except Exception as e:
         print(f"[ODDS ERROR] {race_id}: {e}")
         return []
-
-    finally:
-        drv.quit()
 
 # ── 急変検知 ──────────────────────────────────────────────
 def detect_changes(race, prev_map, curr):
@@ -1001,8 +977,7 @@ async function loadOdds(raceId, raceName, force) {
   const sorted = [...horses].sort((a, b) => a.odds - b.odds);
   const tbody = document.getElementById('odds-tbody');
 
-if (tbody.children.length === 0 || force) {
-  // 初回表示だけ全行作成
+if (!tbody.dataset.init || force) {  // 初回表示だけ全行作成
   tbody.innerHTML = horses.map(h => {
     const sorted = [...horses].sort((a, b) => a.odds - b.odds);
     const rank = sorted.findIndex(s => s.number === h.number) + 1;
@@ -1033,7 +1008,7 @@ if (tbody.children.length === 0 || force) {
       `<span class="pop-tag">${rank}番人気</span>`;
   });
 }
-
+}
 async function reloadOdds() {
   if (selRace) await loadOdds(selRace.race_id, selRace.full_name, true);
 }
