@@ -831,12 +831,17 @@ window.onload = () => {
 
 // ── レース一覧 ───────────────────────────────────────────
 async function loadRaces() {
+  const el = document.getElementById('race-list');
   try {
-    const res = await fetch('/api/races');
+    const res = await fetch('/api/races', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     races = await res.json();
     renderRaces(races);
     updateHeaderStats(races);
-  } catch(e) {}
+  } catch(e) {
+    console.error(e);
+    if (el) el.innerHTML = '<div class="empty">レース一覧の読み込みに失敗しました<br><small>再読み込みしてください</small></div>';
+  }
 }
 
 async function forceRefreshRaces() {
@@ -866,7 +871,7 @@ function renderRaces(list) {
 
   tabs.innerHTML = venues.map(v => {
     const active = v === selectedVenue ? 'active' : '';
-    return `<button class="venue-tab ${active}" onclick="selectVenue('${v}')">${v}</button>`;
+    return `<button class="venue-tab ${active}" data-venue="${v}">${v}</button>`;
   }).join('');
 
   const filtered = list.filter(r => (r.venue || 'その他') === selectedVenue);
@@ -886,8 +891,7 @@ function renderRaces(list) {
              : r.mt > -5 ? '発走直後' : '発走済み';
     const isActive = selRace && selRace.race_id === r.race_id ? 'active' : '';
 
-    return `<div class="race-item ${sc} ${isActive}" id="ri-${r.race_id}"
-              onclick="pickRaceById('${r.race_id}')">
+    return `<div class="race-item ${sc} ${isActive}" id="ri-${r.race_id}" data-race-id="${r.race_id}">
       <div class="ri-top">
         <span class="ri-badge ${bc}">${bl}</span>
         <span class="ri-name">${r.r_num}R ${r.name}</span>
@@ -898,6 +902,13 @@ function renderRaces(list) {
       </div>
     </div>`;
   }).join('');
+
+  tabs.querySelectorAll('.venue-tab').forEach(btn => {
+    btn.addEventListener('click', () => selectVenue(btn.dataset.venue));
+  });
+  el.querySelectorAll('.race-item').forEach(item => {
+    item.addEventListener('click', () => pickRaceById(item.dataset.raceId));
+  });
 }
 
 function selectVenue(venue) {
