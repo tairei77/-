@@ -887,7 +887,7 @@ function renderRaces(list) {
     const isActive = selRace && selRace.race_id === r.race_id ? 'active' : '';
 
     return `<div class="race-item ${sc} ${isActive}" id="ri-${r.race_id}"
-              onclick='pickRace(${JSON.stringify(r)})'>
+              onclick="pickRaceById('${r.race_id}')">
       <div class="ri-top">
         <span class="ri-badge ${bc}">${bl}</span>
         <span class="ri-name">${r.r_num}R ${r.name}</span>
@@ -919,6 +919,12 @@ function updateHeaderStats(list) {
 }
 
 // ── レース選択 ───────────────────────────────────────────
+async function pickRaceById(raceId) {
+  const race = races.find(r => r.race_id === raceId);
+  if (!race) return;
+  await pickRace(race);
+}
+
 async function pickRace(race) {
   selRace = race;
   document.querySelectorAll('.race-item').forEach(e => e.classList.remove('active'));
