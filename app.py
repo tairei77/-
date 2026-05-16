@@ -15,7 +15,7 @@
 # ━━ 設定 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHECK_INTERVAL_SEC    = 60     # オッズ確認頻度（秒）
 MONITOR_BEFORE_MIN    = 600     # 発走N分前から自動監視開始
-ODDS_CHANGE_THRESHOLD = 1.0   # 急変とみなす変化率（%）
+ODDS_CHANGE_THRESHOLD = 20.0   # 急変とみなす変化率（%）
 REQUEST_TIMEOUT       = 15
 REQUEST_INTERVAL_SEC  = 1
 USER_AGENT = (
@@ -29,6 +29,8 @@ import os, re, time, threading, datetime, sys, webbrowser
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 from urllib.parse import urlparse, parse_qs
@@ -201,33 +203,89 @@ def get_driver():
 
 def fetch_odds(race_id):
     url = f"https://race.netkeiba.com/odds/index.html?race_id={race_id}&type=b1"
-    drv = get_driver()
-    drv.get(url)
-    time.sleep(6)
 
-    horses = []
-    rows = drv.find_elements(By.CSS_SELECTOR, "tbody tr")
+    options = Options()
+    # headless外す（表示しないと取得失敗する環境ある）
+    # options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument(f"user-agent={USER_AGENT}")
 
-    for row in rows:
-        try:
-            cols = row.find_elements(By.TAG_NAME, "td")
-            if len(cols) < 4:
+    drv = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options
+    )
+
+    try:
+        drv.get(url)
+
+        WebDriverWait(drv, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "tbody tr"))
+        )
+
+        rows = drv.find_elements(By.CSS_SELECTOR, "tbody tr")
+        horses_dict = {}
+
+        for row in rows:
+            try:
+                cols = row.find_elements(By.TAG_NAME, "td")
+                texts = [c.text.strip() for c in cols if c.text.strip()]
+
+                # デバッグ用
+                # print(texts)
+
+                if len(texts) < 4:
+                    continue
+
+                # 馬番
+                if not texts[0].isdigit():
+                    continue
+                num = int(texts[0])
+
+                # 馬名探し（日本語含む列）
+                name = None
+                for t in texts:
+                    if any('\u3040' <= ch <= '\u30ff' or '\u4e00' <= ch <= '\u9fff' for ch in t):
+                        if not t.replace(".", "").isdigit():
+                            name = t
+                            break
+
+                if not name:
+                    continue
+
+                # オッズ探し
+                odds = None
+                for t in reversed(texts):
+                    t2 = t.replace("倍", "").replace(",", "")
+                    try:
+                        v = float(t2)
+                        if 1 <= v <= 9999:
+                            odds = v
+                            break
+                    except:
+                        continue
+
+                if odds is None:
+                    continue
+
+                horses_dict[num] = {
+                    "number": num,
+                    "name": name,
+                    "odds": odds
+                }
+
+            except:
                 continue
 
-            num = int(cols[0].text.strip())
-            name = cols[1].text.strip()
-            odds_text = cols[-2].text.strip().replace("倍", "")
-            odds = float(odds_text)
+        horses = list(horses_dict.values())
+        return sorted(horses, key=lambda x: x["number"])
 
-            horses.append({
-                "number": num,
-                "name": name,
-                "odds": odds
-            })
-        except:
-            continue
+    except Exception as e:
+        print(f"[ODDS ERROR] {race_id}: {e}")
+        return []
 
-    return sorted(horses, key=lambda x: x["number"])
+    finally:
+        drv.quit()
 
 # ── 急変検知 ──────────────────────────────────────────────
 def detect_changes(race, prev_map, curr):
@@ -237,7 +295,7 @@ def detect_changes(race, prev_map, curr):
             continue
         pct = (h["odds"] - old) / old * 100
         if abs(pct) >= ODDS_CHANGE_THRESHOLD:
-            direction = "急落 ⬇" if h["odds"] < old else "急騰 ⬆"
+            direction = "人気上昇 ↑" if h["odds"] < old else ""
             alert = {
                 "time":       now_jst().strftime("%H:%M:%S"),
                 "race":       race["full_name"],
@@ -941,16 +999,39 @@ async function loadOdds(raceId, raceName, force) {
   document.getElementById('odds-updated').textContent = `更新: ${data.updated}${cacheTag}`;
 
   const sorted = [...horses].sort((a, b) => a.odds - b.odds);
-  document.getElementById('odds-tbody').innerHTML = horses.map(h => {
+  const tbody = document.getElementById('odds-tbody');
+
+if (tbody.children.length === 0 || force) {
+  // 初回表示だけ全行作成
+  tbody.innerHTML = horses.map(h => {
+    const sorted = [...horses].sort((a, b) => a.odds - b.odds);
     const rank = sorted.findIndex(s => s.number === h.number) + 1;
-    const cls  = h.odds <= 3 ? 'low' : h.odds >= 30 ? 'high' : '';
-    return `<tr>
+    const cls = h.odds <= 3 ? 'low' : h.odds >= 30 ? 'high' : '';
+
+    return `<tr id="horse-${h.number}">
       <td><span class="hn">${h.number}</span></td>
       <td>${h.name}</td>
-      <td><span class="odds-num ${cls}">${h.odds.toFixed(1)}倍</span></td>
-      <td><span class="pop-tag">${rank}番人気</span></td>
+      <td class="odds-cell"><span class="odds-num ${cls}">${h.odds.toFixed(1)}倍</span></td>
+      <td class="rank-cell"><span class="pop-tag">${rank}番人気</span></td>
     </tr>`;
   }).join('');
+} else {
+  // 更新時はオッズだけ変更
+  const sorted = [...horses].sort((a, b) => a.odds - b.odds);
+
+  horses.forEach(h => {
+    const row = document.getElementById(`horse-${h.number}`);
+    if (!row) return;
+
+    const rank = sorted.findIndex(s => s.number === h.number) + 1;
+    const cls = h.odds <= 3 ? 'low' : h.odds >= 30 ? 'high' : '';
+
+    row.querySelector('.odds-cell').innerHTML =
+      `<span class="odds-num ${cls}">${h.odds.toFixed(1)}倍</span>`;
+
+    row.querySelector('.rank-cell').innerHTML =
+      `<span class="pop-tag">${rank}番人気</span>`;
+  });
 }
 
 async function reloadOdds() {
@@ -984,7 +1065,7 @@ async function pollAlerts() {
       return;
     }
     el.innerHTML = alerts.map(a => {
-      const d = a.change_pct < 0 ? 'down' : 'up';
+      const d = a.change_pct < 0 ? 'up' : '';
       return `<div class="alert-card ${d}">
         <div class="ac-time">${a.time}</div>
         <div class="ac-body">
