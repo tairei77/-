@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # ============================================================
 #  app.py  ―  中央競馬オッズ急変モニター 完全版（1ファイル）
 #
@@ -184,33 +184,78 @@ def fetch_odds(race_id):
         return []
 
     horses = []
-    # パターン1: 標準テーブル
-    for tr in soup.select("table.RaceOdds_HorseList_Table tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 3:
-            continue
-        try:
-            num  = int(tds[0].get_text(strip=True))
-            name = tds[1].get_text(strip=True)
-            raw  = tds[2].get_text(strip=True).replace(",", "")
-            if not re.fullmatch(r"[\d.]+", raw):
-                continue
-            horses.append({"number": num, "name": name, "odds": float(raw)})
-        except Exception:
+    seen = set()
+
+    def clean_odds(text):
+        text = text.replace(",", "").replace("倍", "").strip()
+        m = re.search(r"\d+(?:\.\d+)?", text)
+        return float(m.group(0)) if m else None
+
+    def add_horse(num, name, odds):
+        if not num or not name or odds is None or num in seen:
+            return
+        seen.add(num)
+        horses.append({"number": int(num), "name": name.strip(), "odds": float(odds)})
+
+    # パターン1: 現行/旧レイアウトのテーブルを広めに読む
+    for tr in soup.select("tr"):
+        row_text = tr.get_text(" ", strip=True)
+        if not row_text:
             continue
 
-    # パターン2: フォールバック
+        num_tag = (
+            tr.select_one(".Umaban")
+            or tr.select_one(".Horse_Num")
+            or tr.select_one("[class*='Umaban']")
+        )
+        name_tag = (
+            tr.select_one(".HorseName")
+            or tr.select_one(".Horse_Name")
+            or tr.select_one("[class*='HorseName']")
+            or tr.select_one("[class*='Horse_Name']")
+        )
+        odds_tag = (
+            tr.select_one(".Odds")
+            or tr.select_one(".OddsTxt")
+            or tr.select_one("[class*='Odds']")
+        )
+
+        num = None
+        if num_tag:
+            m = re.search(r"\d+", num_tag.get_text(" ", strip=True))
+            num = int(m.group(0)) if m else None
+        else:
+            first_td = tr.find("td")
+            if first_td:
+                m = re.fullmatch(r"\d{1,2}", first_td.get_text(" ", strip=True))
+                num = int(m.group(0)) if m else None
+
+        name = name_tag.get_text(" ", strip=True) if name_tag else ""
+        odds = clean_odds(odds_tag.get_text(" ", strip=True)) if odds_tag else None
+
+        # class指定で取れない場合、tdの並びから補完
+        if num and (not name or odds is None):
+            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            if not name:
+                for td in tds:
+                    if re.search(r"[ぁ-んァ-ヶ一-龥A-Za-z]", td) and not re.search(r"人気|オッズ|馬番", td):
+                        name = td
+                        break
+            if odds is None:
+                for td in tds:
+                    candidate = clean_odds(td)
+                    if candidate is not None and "." in td and 1.0 <= candidate <= 9999:
+                        odds = candidate
+                        break
+
+        add_horse(num, name, odds)
+
     if not horses:
-        for row in soup.select("tr[id^='odds-']"):
-            try:
-                num  = int(row.select_one(".Umaban").get_text(strip=True))
-                name = row.select_one(".HorseName").get_text(strip=True)
-                odds = float(row.select_one(".Odds").get_text(strip=True).replace(",", ""))
-                horses.append({"number": num, "name": name, "odds": odds})
-            except Exception:
-                continue
+        title = soup.title.get_text(" ", strip=True) if soup.title else "no title"
+        sample = soup.get_text(" ", strip=True)[:160]
+        _log(f"[ODDS PARSE WARN] {race_id} オッズ0件 title={title} sample={sample}")
 
-    return horses
+    return sorted(horses, key=lambda h: h["number"])
 
 # ── 急変検知 ──────────────────────────────────────────────
 def detect_changes(race, prev_map, curr):
@@ -345,6 +390,11 @@ def api_races():
 
     return jsonify(result)
 
+def _race_by_id(race_id):
+    with lock:
+        races = list(state["races"])
+    return next((r for r in races if r["race_id"] == race_id), None)
+
 @app.route("/api/odds/<race_id>")
 def api_odds(race_id):
     # キャッシュがあればそれを、なければ新規取得
@@ -353,10 +403,12 @@ def api_odds(race_id):
         updated = state["last_updated"].get(race_id, "")
     if cached:
         return jsonify({"horses": cached, "updated": updated, "cached": True})
+
     horses = fetch_odds(race_id)
     updated = now_jst().strftime("%H:%M:%S")
     with lock:
         state["odds"][race_id]         = horses
+        state["prev_odds"][race_id]    = {h["number"]: h["odds"] for h in horses}
         state["last_updated"][race_id] = updated
     return jsonify({"horses": horses,
                     "updated": updated,
@@ -366,8 +418,16 @@ def api_odds(race_id):
 def api_odds_force(race_id):
     horses = fetch_odds(race_id)
     updated = now_jst().strftime("%H:%M:%S")
+    race = _race_by_id(race_id)
+    with lock:
+        prev_map = state["prev_odds"].get(race_id, {})
+
+    if horses and prev_map and race:
+        detect_changes(race, prev_map, horses)
+
     with lock:
         state["odds"][race_id]         = horses
+        state["prev_odds"][race_id]    = {h["number"]: h["odds"] for h in horses}
         state["last_updated"][race_id] = updated
     return jsonify({"horses": horses,
                     "updated": updated,
@@ -766,6 +826,7 @@ window.onload = () => {
   setInterval(loadRaces,  30000);   // 30秒ごとに自動更新
   setInterval(pollAlerts, 5000);    // 5秒ごとにアラート確認
   setInterval(pollLog,    8000);    // 8秒ごとにログ確認
+  setInterval(refreshSelectedOdds, 60000); // 選択中レースは60秒ごとに最新オッズへ更新
 };
 
 // ── レース一覧 ───────────────────────────────────────────
@@ -863,7 +924,7 @@ async function pickRace(race) {
   document.querySelectorAll('.race-item').forEach(e => e.classList.remove('active'));
   document.getElementById('ri-' + race.race_id)?.classList.add('active');
   switchTab('odds');
-  await loadOdds(race.race_id, race.full_name, false);
+  await loadOdds(race.race_id, race.full_name, true);
 }
 
 async function loadOdds(raceId, raceName, force) {
@@ -905,6 +966,12 @@ async function loadOdds(raceId, raceName, force) {
 
 async function reloadOdds() {
   if (selRace) await loadOdds(selRace.race_id, selRace.full_name, true);
+}
+
+async function refreshSelectedOdds() {
+  if (!selRace) return;
+  if (!document.getElementById('tab-odds').classList.contains('active')) return;
+  await loadOdds(selRace.race_id, selRace.full_name, true);
 }
 
 // ── アラート ─────────────────────────────────────────────
