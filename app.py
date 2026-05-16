@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # ============================================================
 #  app.py  ―  中央競馬オッズ急変モニター 完全版（1ファイル）
 #
@@ -14,8 +14,8 @@
 
 # ━━ 設定 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHECK_INTERVAL_SEC    = 60     # オッズ確認頻度（秒）
-MONITOR_BEFORE_MIN    = 30     # 発走N分前から自動監視開始
-ODDS_CHANGE_THRESHOLD = 20.0   # 急変とみなす変化率（%）
+MONITOR_BEFORE_MIN    = 600     # 発走N分前から自動監視開始
+ODDS_CHANGE_THRESHOLD = 1.0   # 急変とみなす変化率（%）
 REQUEST_TIMEOUT       = 15
 REQUEST_INTERVAL_SEC  = 1
 USER_AGENT = (
@@ -26,6 +26,11 @@ USER_AGENT = (
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 import os, re, time, threading, datetime, sys, webbrowser
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 from urllib.parse import urlparse, parse_qs
 from collections import deque
 from flask import Flask, jsonify, Response
@@ -176,86 +181,53 @@ def fetch_today_races():
     _log(f"本日のレース: {len(races)}件 取得完了")
     return races
 # ── オッズ取得 ────────────────────────────────────────────
+driver = None
+
+def get_driver():
+    global driver
+    if driver is None:
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument(f"user-agent={USER_AGENT}")
+
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=options
+        )
+    return driver
+
+
 def fetch_odds(race_id):
-    url = (f"https://race.netkeiba.com/odds/index.html"
-           f"?race_id={race_id}&type=b1")
-    soup = _get(url)
-    if not soup:
-        return []
+    url = f"https://race.netkeiba.com/odds/index.html?race_id={race_id}&type=b1"
+    drv = get_driver()
+    drv.get(url)
+    time.sleep(6)
 
     horses = []
-    seen = set()
+    rows = drv.find_elements(By.CSS_SELECTOR, "tbody tr")
 
-    def clean_odds(text):
-        text = text.replace(",", "").replace("倍", "").strip()
-        m = re.search(r"\d+(?:\.\d+)?", text)
-        return float(m.group(0)) if m else None
+    for row in rows:
+        try:
+            cols = row.find_elements(By.TAG_NAME, "td")
+            if len(cols) < 4:
+                continue
 
-    def add_horse(num, name, odds):
-        if not num or not name or odds is None or num in seen:
-            return
-        seen.add(num)
-        horses.append({"number": int(num), "name": name.strip(), "odds": float(odds)})
+            num = int(cols[0].text.strip())
+            name = cols[1].text.strip()
+            odds_text = cols[-2].text.strip().replace("倍", "")
+            odds = float(odds_text)
 
-    # パターン1: 現行/旧レイアウトのテーブルを広めに読む
-    for tr in soup.select("tr"):
-        row_text = tr.get_text(" ", strip=True)
-        if not row_text:
+            horses.append({
+                "number": num,
+                "name": name,
+                "odds": odds
+            })
+        except:
             continue
 
-        num_tag = (
-            tr.select_one(".Umaban")
-            or tr.select_one(".Horse_Num")
-            or tr.select_one("[class*='Umaban']")
-        )
-        name_tag = (
-            tr.select_one(".HorseName")
-            or tr.select_one(".Horse_Name")
-            or tr.select_one("[class*='HorseName']")
-            or tr.select_one("[class*='Horse_Name']")
-        )
-        odds_tag = (
-            tr.select_one(".Odds")
-            or tr.select_one(".OddsTxt")
-            or tr.select_one("[class*='Odds']")
-        )
-
-        num = None
-        if num_tag:
-            m = re.search(r"\d+", num_tag.get_text(" ", strip=True))
-            num = int(m.group(0)) if m else None
-        else:
-            first_td = tr.find("td")
-            if first_td:
-                m = re.fullmatch(r"\d{1,2}", first_td.get_text(" ", strip=True))
-                num = int(m.group(0)) if m else None
-
-        name = name_tag.get_text(" ", strip=True) if name_tag else ""
-        odds = clean_odds(odds_tag.get_text(" ", strip=True)) if odds_tag else None
-
-        # class指定で取れない場合、tdの並びから補完
-        if num and (not name or odds is None):
-            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-            if not name:
-                for td in tds:
-                    if re.search(r"[ぁ-んァ-ヶ一-龥A-Za-z]", td) and not re.search(r"人気|オッズ|馬番", td):
-                        name = td
-                        break
-            if odds is None:
-                for td in tds:
-                    candidate = clean_odds(td)
-                    if candidate is not None and "." in td and 1.0 <= candidate <= 9999:
-                        odds = candidate
-                        break
-
-        add_horse(num, name, odds)
-
-    if not horses:
-        title = soup.title.get_text(" ", strip=True) if soup.title else "no title"
-        sample = soup.get_text(" ", strip=True)[:160]
-        _log(f"[ODDS PARSE WARN] {race_id} オッズ0件 title={title} sample={sample}")
-
-    return sorted(horses, key=lambda h: h["number"])
+    return sorted(horses, key=lambda x: x["number"])
 
 # ── 急変検知 ──────────────────────────────────────────────
 def detect_changes(race, prev_map, curr):
